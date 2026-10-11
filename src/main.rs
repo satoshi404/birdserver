@@ -139,7 +139,7 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:10000").await.unwrap();
 
-    println!("Servidor rodando em http://0.0.0.0:10000");
+    println!(" [TODO] Servidor rodando em http://0.0.0.0:10000");
     axum::serve(listener, app).await.unwrap();
 }
 
