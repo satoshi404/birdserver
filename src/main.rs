@@ -753,7 +753,8 @@ async fn register(
 
     if skip {
         // entra direto: o app já trata "verificado + token" como login concluído
-        let token = state.new_session(&user_id);
+       // let token = state.new_session(&user_id);
+       let token = issue_token(&state, &user_id);
         return Ok(Json(UserResponse {
             id: user_id,
             nome,
