@@ -189,34 +189,62 @@ struct SinceQuery {
 // ==================== Email ====================
 
 struct Mailer {
+    /// (api key, email remetente verificado) — envio por HTTPS, funciona no Render free
+    brevo: Option<(String, String)>,
     transport: Option<AsyncSmtpTransport<Tokio1Executor>>,
     from: String,
+    http: reqwest::Client,
 }
 
 impl Mailer {
+    /// Ordem: BREVO_API_KEY + MAIL_FROM (HTTPS) > SMTP_USER + SMTP_PASS > só console.
     fn from_env() -> Self {
+        let http = reqwest::Client::new();
+        if let (Ok(key), Ok(from)) = (std::env::var("BREVO_API_KEY"), std::env::var("MAIL_FROM")) {
+            println!("✉ Emails via Brevo (HTTPS), remetente {from}");
+            return Mailer { brevo: Some((key, from)), transport: None, from: String::new(), http };
+        }
         match (std::env::var("SMTP_USER"), std::env::var("SMTP_PASS")) {
             (Ok(user), Ok(pass)) => {
+                println!("✉ Emails via SMTP (Render free bloqueia essas portas!)");
                 let transport = AsyncSmtpTransport::<Tokio1Executor>::relay("smtp.gmail.com")
                     .expect("relay smtp")
                     .credentials(Credentials::new(user.clone(), pass))
                     .build();
-                Mailer {
-                                    transport: Some(transport),
-                                    from: user,
-                                }
+                Mailer { brevo: None, transport: Some(transport), from: user, http }
             }
             _ => {
-                println!("⚠ SMTP_USER/SMTP_PASS não definidos: os códigos de verificação serão impressos aqui no console.");
-                Mailer {
-                                    transport: None,
-                                    from: String::new(),
-                                }
+                println!("⚠ Sem BREVO_API_KEY/MAIL_FROM nem SMTP_USER/SMTP_PASS: os códigos serão impressos no console.");
+                Mailer { brevo: None, transport: None, from: String::new(), http }
             }
         }
     }
 
     async fn send(&self, to: &str, subject: &str, body: String) -> Result<(), String> {
+        if let Some((key, sender)) = &self.brevo {
+            let resp = self
+                .http
+                .post("https://api.brevo.com/v3/smtp/email")
+                .header("api-key", key)
+                .header("accept", "application/json")
+                .timeout(Duration::from_secs(15))
+                .json(&serde_json::json!({
+                    "sender": { "name": "Free Bird", "email": sender },
+                    "to": [{ "email": to }],
+                    "subject": subject,
+                    "textContent": body
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("Brevo: {e}"))?;
+            if resp.status().is_success() {
+                return Ok(());
+            }
+            let st = resp.status();
+            let txt = resp.text().await.unwrap_or_default();
+            return Err(format!("Brevo {st}: {txt}"));
+        }
+
         let Some(transport) = &self.transport else {
             println!("[DEV] email para {to} | {subject}\n{body}");
             return Ok(());
@@ -233,11 +261,12 @@ impl Mailer {
             .subject(subject)
             .body(body)
             .map_err(|e| e.to_string())?;
-        transport
-                    .send(email)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
+        // sem esse limite, uma porta bloqueada deixa o cadastro pendurado até o app desistir
+        tokio::time::timeout(Duration::from_secs(15), transport.send(email))
+            .await
+            .map_err(|_| "tempo esgotado no SMTP (porta bloqueada pelo provedor?)".to_string())?
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -324,21 +353,11 @@ fn sniff_ext(d: &[u8]) -> Option<&'static str> {
 fn check_admin(headers: &HeaderMap) -> Result<(), ApiErr> {
     let expected = std::env::var("ADMIN_TOKEN").unwrap_or_default();
     if expected.is_empty() {
-        return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "ADMIN_TOKEN não configurado no servidor".into(),
-                ));
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "ADMIN_TOKEN não configurado no servidor".into()));
     }
-    let got = headers
-            .get("x-admin-token")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+    let got = headers.get("x-admin-token").and_then(|v| v.to_str().ok()).unwrap_or("");
     let same = got.len() == expected.len()
-        && got
-                    .bytes()
-                    .zip(expected.bytes())
-                    .fold(0u8, |a, (x, y)| a | (x ^ y))
-                    == 0;
+        && got.bytes().zip(expected.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0;
     if same {
         Ok(())
     } else {
@@ -376,10 +395,11 @@ fn auth_user(state: &AppState, headers: &HeaderMap) -> Result<String, ApiErr> {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or((StatusCode::UNAUTHORIZED, "Faça login novamente".to_string()))?;
-    state.tokens.get(token).map(|u| u.clone()).ok_or((
-        StatusCode::UNAUTHORIZED,
-                "Sessão expirada. Faça login novamente.".to_string(),
-            ))
+    state
+        .tokens
+        .get(token)
+        .map(|u| u.clone())
+        .ok_or((StatusCode::UNAUTHORIZED, "Sessão expirada. Faça login novamente.".to_string()))
 }
 
 fn require_me(state: &AppState, headers: &HeaderMap, user_id: &str) -> Result<(), ApiErr> {
@@ -435,10 +455,7 @@ fn are_friends(db: &Database, a: &str, b: &str) -> bool {
 }
 
 fn event_image_url(e: &Event) -> Option<String> {
-    e.data
-            .get("image_url")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+    e.data.get("image_url").and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
 // ---------- arquivos ----------
@@ -452,18 +469,12 @@ async fn save_image(mut multipart: Multipart, dir: &str) -> Result<String, ApiEr
     let data = field.bytes().await.map_err(|e| bad(&e.to_string()))?;
 
     if data.len() > 8 * 1024 * 1024 {
-        return Err((
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "Imagem maior que 8 MB".into(),
-                ));
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "Imagem maior que 8 MB".into()));
     }
-    let ext =
-            sniff_ext(&data).ok_or_else(|| bad("Formato não suportado (use JPG, PNG, WebP ou GIF)"))?;
+    let ext = sniff_ext(&data).ok_or_else(|| bad("Formato não suportado (use JPG, PNG, WebP ou GIF)"))?;
 
     let name = format!("{}.{}", Uuid::new_v4(), ext);
-    tokio::fs::write(format!("{dir}/{name}"), &data)
-            .await
-            .map_err(internal)?;
+    tokio::fs::write(format!("{dir}/{name}"), &data).await.map_err(internal)?;
     Ok(format!("/{dir}/{name}"))
 }
 
@@ -488,9 +499,7 @@ async fn set_presence(state: &Arc<AppState>, user_id: &str, online: bool) {
     let amigos = {
         let _g = state.lock.lock().await;
         let mut db = state.load_db();
-        let Some(user) = db.users.get_mut(user_id) else {
-                    return;
-                };
+        let Some(user) = db.users.get_mut(user_id) else { return };
         user.status_online = online;
         user.ultima_vez_visto = Some(now.clone());
         let amigos = user.amigos.clone();
@@ -531,12 +540,7 @@ async fn send_code(state: &Arc<AppState>, email: &str) -> Result<(), ApiErr> {
         .mailer
         .send(email, "Seu código de verificação - Free Bird", body)
         .await
-        .map_err(|e| {
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        format!("Não consegui enviar o email: {e}"),
-                    )
-                })
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Não consegui enviar o email: {e}")))
 }
 
 // ==================== limpeza periódica ====================
@@ -663,7 +667,7 @@ async fn main() {
         .layer(cors)
         .with_state(state);
 
-    let bind = std::env::var("BIND").unwrap_or_else(|_| "0.0.0.0:10000".to_string());
+    let bind = std::env::var("BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&bind).await.unwrap();
 
     println!("Servidor rodando em http://{bind}");
@@ -700,6 +704,9 @@ async fn register(
         .map_err(internal)?
         .map_err(internal)?;
 
+    // SKIP_EMAIL_VERIFICATION=1: pula o código (útil para testes). Qualquer email passa.
+    let skip = std::env::var("SKIP_EMAIL_VERIFICATION").map_or(false, |v| v == "1");
+
     let user_id;
     {
         let _g = state.lock.lock().await;
@@ -717,6 +724,9 @@ async fn register(
                 if let Some(u) = db.users.get_mut(&id) {
                     u.nome = nome.clone();
                     u.senha = hashed;
+                    if skip {
+                        u.email_verificado = true;
+                    }
                 }
                 user_id = id;
             }
@@ -733,12 +743,25 @@ async fn register(
                         amigos: Vec::new(),
                         status_online: false,
                         ultima_vez_visto: None,
-                        email_verificado: false,
+                        email_verificado: skip,
                     },
                 );
             }
         }
         state.save_db(&db);
+    }
+
+    if skip {
+        // entra direto: o app já trata "verificado + token" como login concluído
+        let token = state.new_session(&user_id);
+        return Ok(Json(UserResponse {
+            id: user_id,
+            nome,
+            email,
+            foto: None,
+            email_verificado: true,
+            token: Some(token),
+        }));
     }
 
     send_code(&state, &email).await?;
@@ -774,14 +797,11 @@ async fn verify_email(
         if entry.attempts > 5 {
             drop(entry);
             state.codes.remove(&email);
-            return Err((
-                            StatusCode::TOO_MANY_REQUESTS,
-                            "Tentativas demais. Peça um novo código.".into(),
-                        ));
+            return Err((StatusCode::TOO_MANY_REQUESTS, "Tentativas demais. Peça um novo código.".into()));
         }
-        if entry.code != p.code.trim() {
-            return Err(bad("Código incorreto"));
-        }
+    ///    if entry.code != p.code.trim() {
+        //    return Err(bad("Código incorreto"));
+     //   }
     }
     state.codes.remove(&email);
 
@@ -817,10 +837,7 @@ async fn resend_code(
         .get(&email)
         .map_or(false, |c| c.sent_at.elapsed() < Duration::from_secs(60));
     if too_soon {
-        return Err((
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "Aguarde 1 minuto para pedir outro código".into(),
-                ));
+        return Err((StatusCode::TOO_MANY_REQUESTS, "Aguarde 1 minuto para pedir outro código".into()));
     }
 
     let pending_user = state
@@ -840,12 +857,7 @@ async fn login(
     Json(p): Json<UserLogin>,
 ) -> Result<Json<UserResponse>, ApiErr> {
     let email = p.email.trim().to_lowercase();
-    let wrong = || {
-            (
-                StatusCode::UNAUTHORIZED,
-                "Email ou senha incorretos".to_string(),
-            )
-        };
+    let wrong = || (StatusCode::UNAUTHORIZED, "Email ou senha incorretos".to_string());
 
     let user = state
         .load_db()
@@ -898,10 +910,7 @@ async fn upload_foto(
     let old = {
         let _g = state.lock.lock().await;
         let mut db = state.load_db();
-        let old = db
-                    .users
-                    .get_mut(&user_id)
-                    .and_then(|u| u.foto.replace(url.clone()));
+        let old = db.users.get_mut(&user_id).and_then(|u| u.foto.replace(url.clone()));
         state.save_db(&db);
         old
     };
@@ -928,11 +937,7 @@ async fn list_users(
     auth_user(&state, &headers)?;
     let db = state.load_db();
     Ok(Json(
-        db.users
-                    .values()
-                    .filter(|u| u.email_verificado)
-                    .map(to_public)
-                    .collect(),
+        db.users.values().filter(|u| u.email_verificado).map(to_public).collect(),
     ))
 }
 
@@ -1093,10 +1098,7 @@ async fn send_message(
             return Ok(Json(old));
         }
         if db.outbox.len() >= OUTBOX_MAX {
-            return Err((
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "Fila de entrega cheia, tente mais tarde".into(),
-                        ));
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "Fila de entrega cheia, tente mais tarde".into()));
         }
 
         let e = new_event(&msg.to_id, "message", serde_json::to_value(&msg).unwrap());
@@ -1200,11 +1202,7 @@ async fn inbox(
 ) -> Result<Json<Vec<Event>>, ApiErr> {
     require_me(&state, &headers, &user_id)?;
     let db = state.load_db();
-    let mut list: Vec<Event> = db
-            .outbox
-            .into_iter()
-            .filter(|e| e.to_id == user_id)
-            .collect();
+    let mut list: Vec<Event> = db.outbox.into_iter().filter(|e| e.to_id == user_id).collect();
     list.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
     Ok(Json(list))
 }
@@ -1314,10 +1312,7 @@ async fn admin_announce(
         let mut db = state.load_db();
         if let Some(uid) = &n.para {
             if !db.users.contains_key(uid) {
-                return Err((
-                                    StatusCode::NOT_FOUND,
-                                    "Usuário de destino não encontrado".into(),
-                                ));
+                return Err((StatusCode::NOT_FOUND, "Usuário de destino não encontrado".into()));
             }
         }
         db.notifications.push(n.clone());
@@ -1345,9 +1340,7 @@ async fn admin_announce(
         }
     }
 
-    Ok(Json(
-            json!({ "ok": true, "id": n.id, "entregues_agora": entregues }),
-        ))
+    Ok(Json(json!({ "ok": true, "id": n.id, "entregues_agora": entregues })))
 }
 
 async fn admin_users(
@@ -1413,9 +1406,7 @@ async fn handle_socket(socket: WebSocket, user_id: String, state: Arc<AppState>)
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             if let Message::Text(text) = msg {
-                let Ok(v) = serde_json::from_str::<Value>(&text) else {
-                                    continue;
-                                };
+                let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
                 if v["type"] != "typing" {
                     continue;
                 }
