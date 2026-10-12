@@ -799,9 +799,9 @@ async fn verify_email(
             state.codes.remove(&email);
             return Err((StatusCode::TOO_MANY_REQUESTS, "Tentativas demais. Peça um novo código.".into()));
         }
-    ///    if entry.code != p.code.trim() {
-        //    return Err(bad("Código incorreto"));
-     //   }
+        if entry.code != p.code.trim() {
+            return Err(bad("Código incorreto"));
+        }
     }
     state.codes.remove(&email);
 
